@@ -7,20 +7,27 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: emscripten-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CPM_SOURCE_CACHE: ${{ github.workspace }}/cpm-cache
 
 jobs:
-  build:
+  build-emscripten:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
     - name: Install dependencies
-      run: pacman -Syu --noconfirm && pacman -S --noconfirm --needed cmake git unzip python ninja zstd
+      run: pacman -Syu --noconfirm && pacman -S --noconfirm --needed cmake git unzip python ninja zstd nodejs
     - name: Setup emscripten
-      uses: mymindstorm/setup-emsdk@v14
+      uses: emscripten-core/setup-emsdk@v16
       with:
-        version: 4.0.10
+        version: 5.0.7
     - name: Trust git repo
       run: git config --global --add safe.directory '*'
     - uses: actions/checkout@v4
@@ -55,7 +62,7 @@ jobs:
         path: bin
   deploy:
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-emscripten
     if: github.ref == 'refs/heads/master'
     steps:
     - uses: actions/download-artifact@v4

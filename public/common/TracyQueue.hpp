@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "TracyAssert.hpp"
 #include "TracyTaggedUserlandAddress.hpp"
 #include "TracyForceInline.hpp"
 
@@ -24,11 +25,21 @@ enum class QueueType : uint8_t
     Callstack,
     CallstackAlloc,
     CallstackSample,
+    CallstackSample32,
+    CallstackSample16,
     CallstackSampleContextSwitch,
+    CallstackSampleContextSwitch32,
+    CallstackSampleContextSwitch16,
     FrameImage,
     ZoneBegin,
+    ZoneBegin32,
+    ZoneBegin16,
     ZoneBeginCallstack,
+    ZoneBeginCallstack32,
+    ZoneBeginCallstack16,
     ZoneEnd,
+    ZoneEnd32,
+    ZoneEnd16,
     LockWait,
     LockObtain,
     LockRelease,
@@ -71,6 +82,9 @@ enum class QueueType : uint8_t
     SourceCodeMetadata,
     FiberEnter,
     FiberLeave,
+    SectionEnter,
+    SectionLeave,
+    SectionSetup,
     Terminate,
     KeepAlive,
     ThreadContext,
@@ -112,6 +126,8 @@ enum class QueueType : uint8_t
     CpuTopology,
     SingleStringData,
     SecondStringData,
+    SingleStringData8,
+    SecondStringData8,
     MemNamePayload,
     ThreadGroupHint,
     GpuZoneAnnotation,
@@ -153,9 +169,31 @@ struct QueueZoneBeginThread : public QueueZoneBegin
     uint32_t thread;
 };
 
+struct QueueZoneBegin32
+{
+    uint32_t time;
+    uint64_t srcloc;
+};
+
+struct QueueZoneBegin16
+{
+    uint16_t time;
+    uint64_t srcloc;
+};
+
 struct QueueZoneEnd
 {
     int64_t time;
+};
+
+struct QueueZoneEnd32
+{
+    uint32_t time;
+};
+
+struct QueueZoneEnd16
+{
+    uint16_t time;
 };
 
 struct QueueZoneEndThread : public QueueZoneEnd
@@ -275,6 +313,36 @@ struct QueueFiberLeave
     uint32_t thread;
 };
 
+struct QueueSectionEnter
+{
+    int64_t time;
+    uint32_t id;
+    uint16_t category;
+};
+
+struct QueueSectionEnterFat : public QueueSectionEnter
+{
+    uint64_t text;      // ptr
+    uint16_t size;
+};
+
+struct QueueSectionLeave
+{
+    int64_t time;
+    uint32_t id;
+};
+
+struct QueueSectionSetup
+{
+    uint16_t category;
+};
+
+struct QueueSectionSetupFat : public QueueSectionSetup
+{
+    uint64_t text;      // ptr
+    uint16_t size;
+};
+
 struct QueueLockTerminate
 {
     uint32_t id;
@@ -358,7 +426,7 @@ enum class MessageSeverity : uint8_t
     Debug,   // Describes variable states and details about specific internal events in the software, that are useful for investigations.
     Info,    // Describes normal events, which inform on the expected progress and state of your software.
     Warning, // Describes potentially dangerous situations caused by unexpected events and states.
-    Error,   // Describes the occurance of unexpected behavior. Does not interrupt the execution of the software.
+    Error,   // Describes the occurrence of unexpected behavior. Does not interrupt the execution of the software.
     Fatal,   // Describes a critical event that will lead to a software failure/crash.
     COUNT
 };
@@ -372,13 +440,13 @@ tracy_force_inline uint8_t MakeMessageMetadata(MessageSourceType source, Message
 
 tracy_force_inline MessageSourceType MessageSourceFromMetadata(uint8_t metadata)
 {
-    assert( ( metadata & 0x0F ) < (uint8_t)MessageSourceType::COUNT );
+    TRACY_ASSERT( ( metadata & 0x0F ) < (uint8_t)MessageSourceType::COUNT );
     return (MessageSourceType)( metadata & 0x0F );
 }
 
 tracy_force_inline MessageSeverity MessageSeverityFromMetadata(uint8_t metadata)
 {
-    assert( ( ( metadata & 0xF0 ) >> 4 ) < (uint8_t)MessageSeverity::COUNT );
+    TRACY_ASSERT( ( ( metadata & 0xF0 ) >> 4 ) < (uint8_t)MessageSeverity::COUNT );
     return (MessageSeverity)( ( metadata & 0xF0 ) >> 4 );
 }
 
@@ -460,13 +528,16 @@ enum class GpuContextType : uint8_t
     Metal,
     Custom,
     CUDA,
-    Rocprof
+    Rocprof,
+    WebGPU
 };
 
 enum GpuContextFlags : uint8_t
 {
     GpuContextCalibration   = 1 << 0
 };
+
+constexpr int32_t InvalidGpuContextId = -1;
 
 struct QueueGpuNewContext
 {
@@ -610,13 +681,25 @@ struct QueueCallstackAllocFatThread : public QueueCallstackAllocFat
 
 struct QueueCallstackSample
 {
-    int64_t time;
     uint32_t thread;
+    int64_t time;
 };
 
 struct QueueCallstackSampleFat : public QueueCallstackSample
 {
     uint64_t ptr;
+};
+
+struct QueueCallstackSample32
+{
+    uint32_t thread;
+    uint32_t time;
+};
+
+struct QueueCallstackSample16
+{
+    uint32_t thread;
+    uint16_t time;
 };
 
 struct QueueCallstackFrameSize
@@ -728,7 +811,7 @@ struct QueueParamSetup
 {
     uint32_t idx;
     uint64_t name;      // ptr
-    uint8_t isBool;
+    uint8_t type;
     int32_t val;
 };
 
@@ -784,7 +867,11 @@ struct QueueItem
         QueueZoneBegin zoneBegin;
         QueueZoneBeginLean zoneBeginLean;
         QueueZoneBeginThread zoneBeginThread;
+        QueueZoneBegin32 zoneBegin32;
+        QueueZoneBegin16 zoneBegin16;
         QueueZoneEnd zoneEnd;
+        QueueZoneEnd32 zoneEnd32;
+        QueueZoneEnd16 zoneEnd16;
         QueueZoneEndThread zoneEndThread;
         QueueZoneValidation zoneValidation;
         QueueZoneValidationThread zoneValidationThread;
@@ -846,6 +933,8 @@ struct QueueItem
         QueueCallstackAllocFatThread callstackAllocFatThread;
         QueueCallstackSample callstackSample;
         QueueCallstackSampleFat callstackSampleFat;
+        QueueCallstackSample32 callstackSample32;
+        QueueCallstackSample16 callstackSample16;
         QueueCallstackFrameSize callstackFrameSize;
         QueueCallstackFrameSizeFat callstackFrameSizeFat;
         QueueCallstackFrame callstackFrame;
@@ -868,6 +957,11 @@ struct QueueItem
         QueueSourceCodeNotAvailable sourceCodeNotAvailable;
         QueueFiberEnter fiberEnter;
         QueueFiberLeave fiberLeave;
+        QueueSectionEnter sectionEnter;
+        QueueSectionEnterFat sectionEnterFat;
+        QueueSectionLeave sectionLeave;
+        QueueSectionSetup sectionSetup;
+        QueueSectionSetupFat sectionSetupFat;
         QueueGpuZoneAnnotation zoneAnnotation;
     };
 };
@@ -890,11 +984,21 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ),                                  // callstack
     sizeof( QueueHeader ),                                  // callstack alloc
     sizeof( QueueHeader ) + sizeof( QueueCallstackSample ),
-    sizeof( QueueHeader ) + sizeof( QueueCallstackSample ), // context switch
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSample32 ),
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSample16 ),
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSample ),   // context switch
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSample32 ), // context switch
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSample16 ), // context switch
     sizeof( QueueHeader ) + sizeof( QueueFrameImage ),
     sizeof( QueueHeader ) + sizeof( QueueZoneBegin ),
+    sizeof( QueueHeader ) + sizeof( QueueZoneBegin32 ),
+    sizeof( QueueHeader ) + sizeof( QueueZoneBegin16 ),
     sizeof( QueueHeader ) + sizeof( QueueZoneBegin ),       // callstack
+    sizeof( QueueHeader ) + sizeof( QueueZoneBegin32 ),     // callstack
+    sizeof( QueueHeader ) + sizeof( QueueZoneBegin16 ),     // callstack
     sizeof( QueueHeader ) + sizeof( QueueZoneEnd ),
+    sizeof( QueueHeader ) + sizeof( QueueZoneEnd32 ),
+    sizeof( QueueHeader ) + sizeof( QueueZoneEnd16 ),
     sizeof( QueueHeader ) + sizeof( QueueLockWait ),
     sizeof( QueueHeader ) + sizeof( QueueLockObtain ),
     sizeof( QueueHeader ) + sizeof( QueueLockRelease ),
@@ -937,6 +1041,9 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ),                                  // SourceCodeMetadata - not for wire transfer
     sizeof( QueueHeader ) + sizeof( QueueFiberEnter ),
     sizeof( QueueHeader ) + sizeof( QueueFiberLeave ),
+    sizeof( QueueHeader ) + sizeof( QueueSectionEnter ),
+    sizeof( QueueHeader ) + sizeof( QueueSectionLeave ),
+    sizeof( QueueHeader ) + sizeof( QueueSectionSetup ),
     // above items must be first
     sizeof( QueueHeader ),                                  // terminate
     sizeof( QueueHeader ),                                  // keep alive
@@ -979,6 +1086,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueCpuTopology ),
     sizeof( QueueHeader ),                                  // single string data
     sizeof( QueueHeader ),                                  // second string data
+    sizeof( QueueHeader ),                                  // single string data, 8 bit length
+    sizeof( QueueHeader ),                                  // second string data, 8 bit length
     sizeof( QueueHeader ) + sizeof( QueueMemNamePayload ),
     sizeof( QueueHeader ) + sizeof( QueueThreadGroupHint ),
     sizeof( QueueHeader ) + sizeof( QueueGpuZoneAnnotation ), // GPU zone annotation

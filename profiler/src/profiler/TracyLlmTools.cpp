@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <curl/curl.h>
+#include <inttypes.h>
 #include <nlohmann/json.hpp>
 #include <libbase64.h>
 #include <pugixml.hpp>
@@ -8,14 +9,20 @@
 #include <tidybuffio.h>
 #include <time.h>
 #include <regex>
+#include <vector>
 
 #include "TracyConfig.hpp"
+#include "TracyDisassembly.hpp"
+#include "TracyLlm.hpp"
 #include "TracyLlmApi.hpp"
 #include "TracyLlmTools.hpp"
 #include "TracyManualData.hpp"
+#include "TracyPrint.hpp"
 #include "TracyStorage.hpp"
 #include "TracyUtility.hpp"
+#include "TracyView.hpp"
 #include "TracyWorker.hpp"
+#include "tracy_pdqsort.h"
 
 constexpr const char* NoNetworkAccess = "Internet access is disabled by the user. Inform the user that they may enable it in the settings, so that you can use the tools to gather information.";
 
@@ -78,9 +85,11 @@ static std::unique_ptr<pugi::xml_document> ParseHtml( const std::string& html )
     return doc;
 }
 
-TracyLlmTools::TracyLlmTools( Worker& worker, const TracyManualData& manual )
+TracyLlmTools::TracyLlmTools( Worker& worker, const View& view, const TracyManualData& manual, const std::vector<LlmSkill>& skills )
     : m_worker( worker )
+    , m_view( view )
     , m_manual( manual )
+    , m_skills( skills )
 {
     int idx = 0;
     for( auto& chunk : m_manual.GetChunks() )
@@ -97,7 +106,6 @@ TracyLlmTools::TracyLlmTools( Worker& worker, const TracyManualData& manual )
         for( auto& line : SplitLines( chunk.text.c_str(), chunk.text.size() ) )
         {
             if( line.empty() ) continue;
-            if( line == "---" || line == ":::" || line == "::: bclogo" ) continue;
             m_chunkData.emplace_back( hdr + line, idx );
         }
         idx++;
@@ -181,6 +189,24 @@ std::string TracyLlmTools::HandleToolCalls( const std::string& tool, const nlohm
         {
             std::string empty;
             return SourceSearch( Param( "query" ), ParamOptBool( "case_insensitive", false ), ParamOptString( "path", empty ) );
+        }
+        else if( tool == "skill" )
+        {
+            return GetSkill( Param( "name" ) );
+        }
+        else if( tool == "symbol_disasm" )
+        {
+            return SymbolDisasm( Param( "address" ) );
+        }
+        else if( tool == "symbol_parents" )
+        {
+            std::string mode = "reached";
+            return SymbolParents( Param( "address" ), ParamOptU32( "limit", 10 ), ParamOptString( "mode", mode ) );
+        }
+        else if( tool == "sampling_stats" )
+        {
+            std::string empty;
+            return SamplingStats( ParamOptString( "query", empty ), ParamOptU32( "limit", 30 ) );
         }
         return "Unknown tool call: " + tool;
     }
@@ -339,15 +365,20 @@ void TracyLlmTools::CancelManualEmbeddings()
     }
 }
 
-int TracyLlmTools::CalcMaxSize() const
+int TracyLlmTools::CalcCtxBasedLimit( int ctxSize )
 {
-    constexpr int limit = 48*1024;
-    if( m_ctxSize <= 0 ) return limit;
+    if( ctxSize <= 0 ) return 0;
 
     // Limit the size of the response to avoid exceeding the context size
     // Assume average token size is 4 bytes. Make space for 8 articles to be retrieved.
-    const int maxSize = ( m_ctxSize * 4 ) / 8;
-    return std::min( maxSize, limit );
+    return ( ctxSize * 4 ) / 8;
+}
+
+int TracyLlmTools::CalcMaxSize() const
+{
+    if( s_config.llmLimitToolReplySize ) return s_config.llmMaxToolReplySizeValue;
+    const int ctxLimit = CalcCtxBasedLimit( m_ctxSize );
+    return ctxLimit > 0 ? ctxLimit : DefaultToolReplyLimit;
 }
 
 std::string TracyLlmTools::TrimString( std::string&& str ) const
@@ -376,7 +407,7 @@ static size_t WriteFn( void* _data, size_t size, size_t num, void* ptr )
     return sz;
 }
 
-std::string TracyLlmTools::FetchWebPage( const std::string& url, bool cache )
+std::string TracyLlmTools::FetchHttp( const std::string& url, const std::vector<const char*>& headers, bool cache )
 {
     auto it = m_webCache.find( url );
     if( it != m_webCache.end() ) return it->second;
@@ -395,7 +426,12 @@ std::string TracyLlmTools::FetchWebPage( const std::string& url, bool cache )
     curl_easy_setopt( curl, CURLOPT_WRITEDATA, &buf );
     curl_easy_setopt( curl, CURLOPT_USERAGENT, s_config.llmUserAgent.c_str() );
 
+    struct curl_slist* headerList = nullptr;
+    for( auto& hdr : headers ) headerList = curl_slist_append( headerList, hdr );
+    if( headerList ) curl_easy_setopt( curl, CURLOPT_HTTPHEADER, headerList );
+
     auto res = curl_easy_perform( curl );
+    if( headerList ) curl_slist_free_all( headerList );
 
     std::string response;
     if( res != CURLE_OK )
@@ -426,7 +462,7 @@ std::string TracyLlmTools::SearchWikipedia( std::string query, const std::string
     NetworkCheck;
 
     std::ranges::replace( query, ' ', '+' );
-    const auto response = FetchWebPage( "https://" + lang + ".wikipedia.org/w/rest.php/v1/search/page?q=" + UrlEncode( query ) + "&limit=10" );
+    const auto response = FetchHttp( "https://" + lang + ".wikipedia.org/w/rest.php/v1/search/page?q=" + UrlEncode( query ) + "&limit=10" );
 
     auto json = nlohmann::json::parse( response );
     if( !json.contains( "pages" ) ) return "No results found";
@@ -438,16 +474,10 @@ std::string TracyLlmTools::SearchWikipedia( std::string query, const std::string
     for( auto& page : pages )
     {
         if( !page.contains( "key" ) ) continue;
-
         const auto key = page["key"].get_ref<const std::string&>();
-
-        auto summary = FetchWebPage( "https://" + lang + ".wikipedia.org/api/rest_v1/page/summary/" + key );
-        auto summaryJson = nlohmann::json::parse( summary );
-
         nlohmann::json j = {
             { "key", key },
             { "title", page["title"] },
-            { "preview", summaryJson["extract"] },
             { "excerpt", page["excerpt"] }
         };
         if( page.contains( "description" ) && !page["description"].is_null() ) j["description"] = page["description"];
@@ -462,7 +492,7 @@ std::string TracyLlmTools::GetWikipedia( std::string page, const std::string& la
     NetworkCheck;
 
     std::ranges::replace( page, ' ', '_' );
-    auto res = FetchWebPage( "https://" + lang + ".wikipedia.org/w/rest.php/v1/page/" + page );
+    auto res = FetchHttp( "https://" + lang + ".wikipedia.org/w/rest.php/v1/page/" + page );
 
     return TrimString( std::move( res ) );
 }
@@ -472,7 +502,7 @@ std::string TracyLlmTools::GetDictionary( std::string word, const std::string& l
     NetworkCheck;
 
     std::ranges::replace( word, ' ', '+' );
-    const auto response = FetchWebPage( "https://" + lang + ".wiktionary.org/w/rest.php/v1/search/page?q=" + UrlEncode( word ) + "&limit=1" );
+    const auto response = FetchHttp( "https://" + lang + ".wiktionary.org/w/rest.php/v1/search/page?q=" + UrlEncode( word ) + "&limit=1" );
 
     auto json = nlohmann::json::parse( response );
     if( !json.contains( "pages" ) ) return "No results found";
@@ -484,7 +514,7 @@ std::string TracyLlmTools::GetDictionary( std::string word, const std::string& l
     if( !page0.contains( "key" ) ) return "No results found";
 
     const auto key = page0["key"].get_ref<const std::string&>();
-    auto res = FetchWebPage( "https://" + lang + ".wiktionary.org/w/rest.php/v1/page/" + key );
+    auto res = FetchHttp( "https://" + lang + ".wiktionary.org/w/rest.php/v1/page/" + key );
 
     return TrimString( std::move( res ) );
 }
@@ -508,34 +538,94 @@ static void ReplaceAll( std::string& str, std::string_view from, std::string_vie
 std::string TracyLlmTools::SearchWeb( std::string query )
 {
     NetworkCheck;
-
     query = UrlEncode( query );
+
+    if( !s_config.llmSearchBraveApiKey.empty() )
+    {
+        const auto result = SearchWebBrave( query );
+        if( !result.starts_with( "Error:" ) && !result.starts_with( "No results" ) ) return result;
+    }
 
     if( !s_config.llmSearchApiKey.empty() && !s_config.llmSearchIdentifier.empty() )
     {
-        const auto response = FetchWebPage( "https://customsearch.googleapis.com/customsearch/v1?key=" + s_config.llmSearchApiKey + "&cx=" + s_config.llmSearchIdentifier + "&q=" + query );
-        try
-        {
-            auto json = nlohmann::json::parse( response );
-            if( json.contains( "items" ) && json["items"].size() != 0 )
-            {
-                nlohmann::json results;
-                for( size_t i = 0; i < json["items"].size(); i++ )
-                {
-                    auto& item = json["items"][i];
-                    nlohmann::json result;
-                    result["title"] = RemoveNewline( item["title"].get_ref<const std::string&>() );
-                    result["preview"] = RemoveNewline( item["snippet"].get_ref<const std::string&>() );
-                    result["url"] = RemoveNewline( item["link"].get_ref<const std::string&>() );
-                    results[i] = result;
-                }
-                return results.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
-            }
-        }
-        catch( const nlohmann::json::exception& e ) {}
+        const auto result = SearchWebGoogle( query );
+        if( !result.starts_with( "Error:" ) && !result.starts_with( "No results" ) ) return result;
     }
 
-    const auto response = FetchWebPage( "https://lite.duckduckgo.com/lite?q=" + query );
+    return SearchWebDuckDuckGo( query );
+}
+
+std::string TracyLlmTools::SearchWebGoogle( std::string query )
+{
+    const auto response = FetchHttp( "https://customsearch.googleapis.com/customsearch/v1?key=" + s_config.llmSearchApiKey + "&cx=" + s_config.llmSearchIdentifier + "&q=" + query );
+    try
+    {
+        auto json = nlohmann::json::parse( response );
+        if( json.contains( "items" ) && json["items"].size() != 0 )
+        {
+            nlohmann::json results;
+            for( size_t i = 0; i < json["items"].size(); i++ )
+            {
+                auto& item = json["items"][i];
+                nlohmann::json result;
+                result["title"] = RemoveNewline( item["title"].get_ref<const std::string&>() );
+                result["preview"] = RemoveNewline( item["snippet"].get_ref<const std::string&>() );
+                result["url"] = RemoveNewline( item["link"].get_ref<const std::string&>() );
+                results[i] = result;
+            }
+            return results.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+        }
+    }
+    catch( const nlohmann::json::exception& e ) {}
+
+    return "Error: Google search failed";
+}
+
+std::string TracyLlmTools::SearchWebBrave( std::string query )
+{
+    const std::string header = "X-Subscription-Token: " + s_config.llmSearchBraveApiKey;
+    const std::vector<const char*> headers = { header.c_str() };
+    const auto response = FetchHttp( "https://api.search.brave.com/res/v1/web/search?q=" + query, headers );
+    try
+    {
+        auto json = nlohmann::json::parse( response );
+        nlohmann::json results;
+
+        auto gatherResults = [&results, &json]( const char* key ) {
+            if( !json.contains( key ) ) return;
+            auto& keyItem = json[key];
+            if( !keyItem.contains( "results" ) ) return;
+            auto& resultsItem = keyItem["results"];
+            if( resultsItem.size() == 0 ) return;
+
+            for( auto& item : resultsItem )
+            {
+                nlohmann::json result;
+                if( item.contains( "age" ) ) result["age"] = RemoveNewline( item["age"].get_ref<const std::string&>() );
+                result["title"] = RemoveNewline( item["title"].get_ref<const std::string&>() );
+                result["preview"] = RemoveNewline( item["description"].get_ref<const std::string&>() );
+                result["url"] = RemoveNewline( item["url"].get_ref<const std::string&>() );
+                results.emplace_back( result );
+            }
+        };
+
+        gatherResults( "web" );
+        gatherResults( "discussions" );
+        gatherResults( "news" );
+        gatherResults( "locations" );
+        gatherResults( "videos" );
+
+        if( !results.empty() ) return results.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+    }
+    catch( const nlohmann::json::exception& e ) {}
+
+    return "Error: Brave search failed";
+}
+
+std::string TracyLlmTools::SearchWebDuckDuckGo( std::string query )
+{
+    auto response = FetchHttp( "https://lite.duckduckgo.com/lite?q=" + query );
+    if( response.starts_with( "Error:" ) ) return response;
 
     auto doc = ParseHtml( response );
     if( !doc ) return "Error: Failed to parse HTML";
@@ -634,7 +724,8 @@ std::string TracyLlmTools::GetWebpage( const std::string& url )
 {
     NetworkCheck;
 
-    auto data = FetchWebPage( url, false );
+    // Disable caching of raw HTML, we will cache the cleaned up version down below
+    auto data = FetchHttp( url, {}, false );
     auto doc = ParseHtml( data );
     if( !doc ) return "Error: Failed to parse HTML";
 
@@ -762,12 +853,17 @@ std::string TracyLlmTools::SearchManual( const std::string& query, TracyLlmApi& 
     for( auto& chunk : chunks )
     {
         auto& m = manualChunks[chunk.first];
-        nlohmann::json r;
-        r["distance"] = chunk.second;
-        r["content"] = m.text;
-        r["section"] = m.section;
-        r["title"] = m.title;
-        r["parents"] = m.parents;
+
+        nlohmann::json r = {
+            { "distance", chunk.second },
+            { "content", m.text },
+            { "parents", m.parents }
+        };
+
+        if( !m.title.empty() ) r["title"] = m.title;
+        if( !m.section.empty() ) r["section"] = m.section;
+        if( !m.link.empty() ) r["link"] = m.link;
+
         json.emplace_back( std::move( r ) );
     }
 
@@ -778,6 +874,7 @@ std::string TracyLlmTools::SourceFile( const std::string& file, uint32_t line, u
 {
     if( line == 0 ) return "Error: Source file line number must be greater than 0.";
 
+    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
     const auto data = m_worker.GetSourceFileFromCache( file.c_str() );
     if( data.data == nullptr ) return "Error: Source file not available.";
 
@@ -811,13 +908,13 @@ std::string TracyLlmTools::SourceFile( const std::string& file, uint32_t line, u
 
     nlohmann::json json = {
         { "file", file },
-        { "hint", "Each line starts with a line number, then: space, pipe, space, then the actual line content." },
+        { "hint", "Each line starts with a line number, then ':', then the actual line content." },
     };
 
     std::string contents;
     for( uint32_t i = minLine; i < maxLine; i++ )
     {
-        contents += std::to_string( i+1 ) + " | " + lines[i] + "\n";
+        contents += std::to_string( i+1 ) + ":" + lines[i] + "\n";
     }
 
     json.push_back( { "contents", std::move( contents ) } );
@@ -827,9 +924,10 @@ std::string TracyLlmTools::SourceFile( const std::string& file, uint32_t line, u
 
 std::string TracyLlmTools::SourceSearch( std::string query, bool caseInsensitive, const std::string& path ) const
 {
+    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
     auto& cache = m_worker.GetSourceFileCache();
     nlohmann::json json = {
-        { "hint", "Each line starts with a line number, then: space, pipe, space, then the actual line content." }
+        { "hint", "Each line starts with a line number, then ':', then the actual line content." }
     };
 
     if( caseInsensitive ) std::ranges::transform( query, query.begin(), []( char c ) { return std::tolower( c ); } );
@@ -858,7 +956,7 @@ std::string TracyLlmTools::SourceSearch( std::string query, bool caseInsensitive
     size_t total = 0;
     for( auto& item : cache )
     {
-        if( IsFrameExternal( item.first, nullptr ) ) continue;
+        if( m_worker.IsFrameExternal( StringIdx( m_worker.FindStringIdx( item.first ) ), StringIdx() ) ) continue;
         if( !path.empty() && !std::regex_search( item.first, rxPath ) ) continue;
 
         char* tmp = nullptr;
@@ -892,14 +990,14 @@ std::string TracyLlmTools::SourceSearch( std::string query, bool caseInsensitive
             auto linesOrig = SplitLines( mem.data, mem.len );
             for( auto& line : res )
             {
-                r += std::to_string( line + 1 ) + " | " + linesOrig[line] + "\n";
+                r += std::to_string( line + 1 ) + ":" + linesOrig[line] + "\n";
             }
         }
         else
         {
             for( auto& line : res )
             {
-                r += std::to_string( line + 1 ) + " | " + lines[line] + "\n";
+                r += std::to_string( line + 1 ) + ":" + lines[line] + "\n";
             }
         }
 
@@ -928,6 +1026,227 @@ std::string TracyLlmTools::SourceSearch( std::string query, bool caseInsensitive
         if( ret.size() > CalcMaxSize() ) return "Too many matches found.";
     }
     return ret;
+}
+
+std::string TracyLlmTools::GetSkill( const std::string& name ) const
+{
+    auto it = std::ranges::find_if( m_skills, [&name]( const auto& skill ) { return skill.name == name; } );
+    if( it == m_skills.end() ) return "No such skill.";
+    return it->content;
+}
+
+std::string TracyLlmTools::SymbolDisasm( const std::string& address ) const
+{
+    if( !m_worker.AreCallstackSamplesReady() || !m_worker.AreSymbolSamplesReady() ) return "Sampling data is not ready yet. Wait for background processing to complete.";
+    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
+    uint64_t symaddr = strtoull( address.c_str(), nullptr, 16 );
+    auto json = JsonDisassembly( symaddr, m_worker, m_view );
+    auto ret = json.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+    if( ret.size() > CalcMaxSize() ) return "Too much data.";
+    return ret;
+}
+
+std::string TracyLlmTools::SymbolParents( const std::string& address, uint32_t limit, const std::string& mode ) const
+{
+    if( !m_worker.AreCallstackSamplesReady() ) return "Sampling data is not ready yet. Wait for background processing to complete.";
+
+    int statMode;
+    if( mode == "reached" ) statMode = 1;
+    else if( mode == "reached_recursive" ) statMode = 2;
+    else if( mode == "executing" ) statMode = 0;
+    else return "Unknown mode: " + mode;
+
+    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
+    uint64_t symAddr = strtoull( address.c_str(), nullptr, 16 );
+    auto ss = m_worker.GetSymbolStats( symAddr );
+    if( !ss ) return "No parent callstack data for this symbol.";
+
+    const auto symbol = m_worker.GetSymbolData( symAddr );
+    if( !symbol ) return "Symbol not found.";
+
+    unordered_flat_map<uint32_t, uint32_t> stats;
+    uint64_t total = 0;
+    if( statMode == 0 )
+    {
+        stats = ss->wasExecuting;
+        total = ss->excl;
+        if( !symbol->isInline )
+        {
+            const auto symLen = symbol->size.Val();
+            auto inSym = m_worker.GetInlineSymbolList( symAddr, symLen );
+            if( inSym )
+            {
+                const auto symEnd = symAddr + symLen;
+                while( *inSym < symEnd )
+                {
+                    auto istat = m_worker.GetSymbolStats( *inSym++ );
+                    if( !istat ) continue;
+                    total += istat->excl;
+                    for( auto& v : istat->wasExecutingBase )
+                    {
+                        auto it = stats.find( v.first );
+                        if( it == stats.end() )
+                        {
+                            stats[v.first] = v.second;
+                        }
+                        else
+                        {
+                            it->second += v.second;
+                        }
+                    }
+                }
+            }
+        }
+        if( stats.empty() ) return "The symbol was never sampled while it was executing. Use the \"reached\" mode to see the stacks through which it was present deeper on the call stack.";
+    }
+    else
+    {
+        // A base symbol is always present as the last frame of any frame group containing
+        // its inline functions, so the wasReached maps already cover the whole symbol.
+        stats = statMode == 1 ? ss->wasReachedNonReentrant : ss->wasReached;
+        for( auto& v : stats ) total += v.second;
+        if( stats.empty() ) return "No parent callstack data for this symbol.";
+    }
+
+    std::vector<decltype(stats.begin())> sorted;
+    sorted.reserve( stats.size() );
+    for( auto it = stats.begin(); it != stats.end(); ++it ) sorted.push_back( it );
+    pdqsort_branchless( sorted.begin(), sorted.end(), []( const auto& lhs, const auto& rhs ) { return lhs->second > rhs->second; } );
+    if( sorted.size() > limit ) sorted.resize( limit );
+
+    nlohmann::json result = {
+        { "mode", mode },
+        { "entries", nlohmann::json::array() },
+        { "hint", "Frame N is where frame N-1 returns to. The caller of frame N-1 may differ from frame N." }
+    };
+    auto& entries = result["entries"];
+
+    for( auto& entry : sorted )
+    {
+        auto& cs = m_worker.GetSyntheticCallstack( entry->first );
+        auto frames = m_view.GetCallstackJson( cs.data(), cs.size() )["frames"];
+
+        char buf[32];
+        auto end = PrintFloat( buf, buf+32, 100.f * entry->second / total, 4 );
+        *end = '\0';
+
+        entries.push_back( {
+            { "callstack", frames },
+            { "percentage", buf }
+        } );
+    }
+    return result.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+}
+
+std::string TracyLlmTools::SamplingStats( const std::string& query, uint32_t limit ) const
+{
+    if( !m_worker.AreCallstackSamplesReady() || !m_worker.AreSymbolSamplesReady() ) return "Sampling data is not ready yet. Wait for background processing to complete.";
+    if( m_worker.GetCallstackSampleCount() == 0 ) return "No call stack samples in this trace.";
+
+    std::lock_guard<std::mutex> lock( m_worker.GetDataLock() );
+
+    std::regex rx;
+    if( !query.empty() )
+    {
+        try
+        {
+            rx = std::regex( query );
+        }
+        catch( const std::regex_error& e )
+        {
+            return "Error: Invalid query regex: " + std::string( e.what() );
+        }
+    }
+
+    const auto& symMap = m_worker.GetSymbolMap();
+    const auto& symStat = m_worker.GetSymbolStats();
+
+    struct SymEntry
+    {
+        uint64_t symAddr;
+        uint32_t excl;
+    };
+
+    std::vector<SymEntry> data;
+    data.reserve( symStat.size() );
+    for( auto& v : symStat )
+    {
+        auto sit = symMap.find( v.first );
+        if( sit == symMap.end() ) continue;
+        data.emplace_back( v.first, v.second.excl );
+    }
+    if( data.empty() ) return "No symbol statistics available.";
+
+    unordered_flat_map<uint64_t, SymEntry> baseMap;
+    for( auto& v : data )
+    {
+        auto sym = m_worker.GetSymbolData( v.symAddr );
+        const auto symAddr = ( sym && sym->isInline ) ? m_worker.GetSymbolForAddress( v.symAddr ) : v.symAddr;
+        auto it = baseMap.find( symAddr );
+        if( it == baseMap.end() )
+        {
+            baseMap.emplace( symAddr, SymEntry { symAddr, v.excl } );
+        }
+        else
+        {
+            assert( symAddr == it->second.symAddr );
+            it->second.excl += v.excl;
+        }
+    }
+
+    data.clear();
+    for( auto& v : baseMap )
+    {
+        auto sit = symMap.find( v.second.symAddr );
+        if( sit == symMap.end() ) continue;
+        if( !query.empty() )
+        {
+            const auto name = m_worker.GetString( sit->second.name );
+            if( !std::regex_search( name, rx ) ) continue;
+        }
+        data.emplace_back( v.second );
+    }
+    if( data.empty() ) return "No symbols match the query.";
+
+    pdqsort_branchless( data.begin(), data.end(), []( const auto& l, const auto& r ) { return l.excl > r.excl; } );
+    if( data.size() > limit ) data.resize( limit );
+
+    const auto period = m_worker.GetSamplingPeriod();
+    const auto cnt = m_worker.GetCallstackSampleCount();
+    const auto ctx = m_worker.GetContextSwitchSampleCount();
+    const auto totalSamples = cnt > ctx ? cnt - ctx : 0;
+
+    nlohmann::json result = {
+        { "total_time", TimeToString( totalSamples * period ) },
+        { "entries", nlohmann::json::array() },
+        { "hint", "Entries are sorted by exclusive time (child time not included), highest first." }
+    };
+    auto& entries = result["entries"];
+
+    for( auto& v : data )
+    {
+        auto sit = symMap.find( v.symAddr );
+        assert( sit != symMap.end() );
+
+        char addr[32];
+        snprintf( addr, sizeof( addr ), "0x%" PRIx64, v.symAddr );
+
+        const auto file = m_worker.GetString( sit->second.file );
+        char loc[1024];
+        snprintf( loc, sizeof( loc ), "%s:%u", file, sit->second.line );
+
+        entries.push_back( {
+            { "name", m_worker.GetString( sit->second.name ) },
+            { "address", addr },
+            { "location", loc },
+            { "image", m_worker.GetString( sit->second.imageName ) },
+            { "time", TimeToString( v.excl * period ) },
+            { "code_size", MemSizeToString( sit->second.size.Val() ) },
+            { "external", m_worker.IsFrameExternal( sit->second.file, sit->second.imageName ) }
+        } );
+    }
+
+    return result.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
 }
 
 }

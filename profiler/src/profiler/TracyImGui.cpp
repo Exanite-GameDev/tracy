@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <string>
+#include <string.h>
 
 #include "TracyPrint.hpp"
 #include "TracyImGui.hpp"
@@ -134,6 +135,7 @@ bool PrintTextWrapped( const char* text, const char* end, bool strikethrough, bo
     if( !end ) end = text + strlen( text );
 
     auto firstWord = text;
+    while( firstWord < end && *firstWord == ' ' ) firstWord++;
     while( firstWord < end && *firstWord != ' ' && *firstWord != '\n' ) firstWord++;
 
     const auto fontSize = ImGui::GetFontSize();
@@ -145,13 +147,31 @@ bool PrintTextWrapped( const char* text, const char* end, bool strikethrough, bo
     auto fwLen = ImGui::CalcTextSize( text, firstWord ).x;
     if( fwLen > left )
     {
+        const auto textPrev = text;
+        while( text < firstWord && *text == ' ' ) text++;
+
         const auto prev = left;
         ImGui::NewLine();
         left = ImGui::GetContentRegionAvail().x;
-        if( left == prev ) ImGui::SameLine( 0, 0 );
+        if( left == prev )
+        {
+            ImGui::SameLine( 0, 0 );    // undo NewLine
+            text = textPrev;
+        }
     }
 
     auto endLine = ImGui::GetFont()->CalcWordWrapPosition( fontSize, text, end, left );
+    // A word wider than the leftover that continues previous text must move whole
+    // to the next line, not be cut mid-word. ImGui's CalcWordWrapPosition() only
+    // cuts words that fit on no line (i.e. words wider than the full line width),
+    // so a mid-word cut on a glued continuation is a wrap-width artifact.
+    if( endLine < end && endLine > text && endLine[-1] != ' ' && endLine[-1] != '\n' && endLine[0] != ' ' && endLine[0] != '\n' )
+    {
+        const auto isWordChar = []( char c ) { return c != ' ' && c != '\n' && strchr( ",.;:!?\"'()", c ) == nullptr; };
+        const char* ws = endLine;
+        while( ws > text && isWordChar( ws[-1] ) ) ws--;
+        if( ws > text ) endLine = ws;   // continuation word -> move it whole
+    }
     if( strikethrough || underline )
     {
         auto y1 = ImGui::GetCursorScreenPos().y + fontSize05;
@@ -161,8 +181,8 @@ bool PrintTextWrapped( const char* text, const char* end, bool strikethrough, bo
         ImGui::SameLine( 0, 0 );
         auto x1 = ImGui::GetCursorScreenPos().x + scale;
         ImGui::NewLine();
-        if( strikethrough ) ImGui::GetWindowDrawList()->AddLine( ImVec2( x0, y1 ), ImVec2( x1, y1 ), color, scale );
-        if( underline ) ImGui::GetWindowDrawList()->AddLine( ImVec2( x0, y2 ), ImVec2( x1, y2 ), color, scale );
+        if( strikethrough ) ImGui::GetWindowDrawList()->AddLineH( x0, x1, y1, color, scale );
+        if( underline ) ImGui::GetWindowDrawList()->AddLineH( x0, x1, y2, color, scale );
     }
     else
     {
@@ -186,8 +206,8 @@ bool PrintTextWrapped( const char* text, const char* end, bool strikethrough, bo
             ImGui::SameLine( 0, 0 );
             auto x1 = ImGui::GetCursorScreenPos().x + scale;
             ImGui::NewLine();
-            if( strikethrough ) ImGui::GetWindowDrawList()->AddLine( ImVec2( x0, y1 ), ImVec2( x1, y1 ), color, scale );
-            if( underline ) ImGui::GetWindowDrawList()->AddLine( ImVec2( x0, y2 ), ImVec2( x1, y2 ), color, scale );
+            if( strikethrough ) ImGui::GetWindowDrawList()->AddLineH( x0, x1, y1, color, scale );
+            if( underline ) ImGui::GetWindowDrawList()->AddLineH( x0, x1, y2, color, scale );
         }
         else
         {
@@ -197,6 +217,26 @@ bool PrintTextWrapped( const char* text, const char* end, bool strikethrough, bo
     }
 
     return hovered;
+}
+
+bool DragHeightSplitter( const char* id, float& height, float minHeight, float maxHeight, float thickness )
+{
+    ImGui::InvisibleButton( id, ImVec2( -1, thickness * 1.5f ) );
+    const bool active = ImGui::IsItemActive();
+    if( active ) height = std::clamp( height + ImGui::GetIO().MouseDelta.y, minHeight, maxHeight );
+    if( ImGui::IsItemHovered() || active ) ImGui::SetMouseCursor( ImGuiMouseCursor_ResizeNS );
+
+    auto color = ImGui::GetColorU32( ImGuiCol_Separator );
+    if( active ) color = ImGui::GetColorU32( ImGuiCol_SeparatorActive );
+    else if( ImGui::IsItemHovered() ) color = ImGui::GetColorU32( ImGuiCol_SeparatorHovered );
+
+    auto draw = ImGui::GetWindowDrawList();
+    const auto p0 = ImGui::GetItemRectMin();
+    const auto p1 = ImGui::GetItemRectMax();
+    const float y = ( p0.y + p1.y ) * 0.5f;
+    draw->AddLineH( p0.x, p1.x, y, color, thickness );
+
+    return active;
 }
 
 }
